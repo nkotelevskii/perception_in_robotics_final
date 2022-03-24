@@ -1,9 +1,12 @@
 import argparse
-import os
 import shutil
 
 import cv2 as cv
 import numpy as np
+import pykitti
+
+from SuperGluePretrainedNetwork.models import utils
+from rpe import transform44
 
 
 def chunks(lst, n):
@@ -19,6 +22,28 @@ def get_euler_angles(R):
     theta_z = np.arctan2(R[1, 0], R[0, 0])
 
     return theta_x, theta_y, theta_z
+
+
+def n_of_matches(path_to_results):
+    all_resulting_paths = [os.path.join(path_to_results, name) for name in os.listdir(path_to_results) if
+                           name.endswith('.npz')]
+
+    number_of_matches = []
+    percentage_of_matches = []
+    for path in all_resulting_paths:
+        res = np.load(path, allow_pickle=True)
+        if 'arr_0' in res.keys():
+            res = res['arr_0'][()]
+        number_of_matches.append(np.sum(res['matches'] > -1))
+        percentage_of_matches.append(
+            np.sum(res['matches'] > -1) / ((res['keypoints0'].shape[0] + res['keypoints1'].shape[0]) / 2.))
+
+    return {
+        "average_number_of_matches": np.mean(number_of_matches),
+        "std_number_of_matches": np.std(number_of_matches),
+        "average_percentage_of_matches": np.mean(percentage_of_matches),
+        "std_percentage_of_matches": np.std(percentage_of_matches),
+    }
 
 
 def avg_number_of_matches(path_to_pairs: str, path_to_output: str,
@@ -68,35 +93,29 @@ def avg_number_of_matches_superglue(path_to_pairs: str, path_to_image_folder: st
         LAUNCHING_COMMAND_SUPERGLUE += ' --viz'
     os.system(LAUNCHING_COMMAND_SUPERGLUE)
 
-    all_resulting_paths = [os.path.join(path_to_results, name) for name in os.listdir(path_to_results) if
-                           name.endswith('.npz')]
-
-    number_of_matches = []
-    percentage_of_matches = []
-    for path in all_resulting_paths:
-        res = np.load(path)
-        number_of_matches.append(np.sum(res['matches'] > -1))
-        percentage_of_matches.append(
-            np.sum(res['matches'] > -1) / ((res['keypoints0'].shape[0] + res['keypoints1'].shape[0]) / 2.))
-
-    return {
-        "average_number_of_matches": np.mean(number_of_matches),
-        "std_number_of_matches": np.std(number_of_matches),
-        "average_percentage_of_matches": np.mean(percentage_of_matches),
-        "std_percentage_of_matches": np.std(percentage_of_matches),
-    }
+    result = n_of_matches(path_to_results)
+    return result
 
 
-def get_rbt_estimation(points1: np.ndarray, points2: np.ndarray, K: np.ndarray, distCoeffs: np.ndarray) -> dict:
+def get_rbt_estimation(points1: np.ndarray, points2: np.ndarray, dataset_name: str = 'kitti_1') -> dict:
     """
     The function computes estimateion of RBT
+    :param dataset_name: dataset name
     :param points1: An array of keypoints from the 1st image
     :param points2: An array of keypoints from the 2nd image in the corresponding order
-    :param K: Camera matrix (matrix of intrinsics)
-    :param distCoeffs: Distortion coefficients
     :return:
     The function returns a dictionary with estimations of camera rotation, translation and their composition (RBT)
     """
+    if dataset_name == 'kitti_1':
+        K = np.array(
+            "9.812178e+02 0.000000e+00 6.900000e+02 0.000000e+00 9.758994e+02 2.471364e+02 0.000000e+00 0.000000e+00 1.000000e+00".split()).astype(
+            float).reshape(3, 3)
+        distCoeffs = np.array(
+            "-3.791375e-01 2.148119e-01 1.227094e-03 2.343833e-03 -7.910379e-02".split()).astype(float).reshape(1, 5)
+    elif dataset_name == 'tum_1':
+        K = np.array("517.3 0 318.6 0 516.5 255.3 0 0 1".split()).astype(float).reshape(3, 3)
+        distCoeffs = np.array("0.2624  -0.9531  -0.0054  0.0026  1.1633".split()).astype(float).reshape(1, 5)
+
     pts_l_norm = cv.undistortPoints(np.expand_dims(points1, axis=1), cameraMatrix=K, distCoeffs=distCoeffs)
     pts_r_norm = cv.undistortPoints(np.expand_dims(points2, axis=1), cameraMatrix=K, distCoeffs=distCoeffs)
 
@@ -110,6 +129,109 @@ def get_rbt_estimation(points1: np.ndarray, points2: np.ndarray, K: np.ndarray, 
         "R_hat": R_hat,
         "t_hat": t_hat,
         "T_hat": T_hat,
+    }
+
+
+import os
+import numpy as np
+
+
+def get_observations_from_gt(filepath, obs_path='groundtruth.txt', index=0):
+    best_res, best_obs = float('inf'), None
+    gt_ts = float(os.path.basename(filepath).split("_")[index])
+    with open(obs_path, 'r') as file:
+        for _ in range(3): file.readline()
+        for line in file:
+            ts, *obs = line.split(' ')
+
+            res = abs(gt_ts - float(ts.strip()))
+            if res < best_res:
+                best_res, best_obs = res, obs
+
+    return np.fromiter(map(lambda x: x.strip(), best_obs), dtype=float)
+
+
+def rgbd_rotation_error(path_to_results='results/kitti_test_output/'):
+    K = np.array("517.3 0 318.6 0 516.5 255.3 0 0 1".split()).astype(float).reshape(3, 3)
+    names = [n for n in sorted(os.listdir(path_to_results)) if n.endswith('npz')]
+
+    angle_error = []
+    translation_error = []
+
+    for i in range(len(names)):
+        n = os.path.join(path_to_results, names[i])
+        loaded_data = np.load(n, allow_pickle=True)
+
+        if 'arr_0' in loaded_data.keys():
+            loaded_data = loaded_data['arr_0'][()]
+        match_indices = loaded_data['matches'][loaded_data['matches'] > -1]
+        points1 = loaded_data['keypoints0'][loaded_data['matches'] > -1]
+        points2 = loaded_data['keypoints1'][match_indices]
+
+        ret = utils.estimate_pose(points1, points2, K, K, 3.)
+        if ret is None:
+            err_t, err_R = np.inf, np.inf
+        else:
+            R, t, inliers = ret
+
+            vec1 = get_observations_from_gt(n, index=0)
+            vec1 = np.insert(vec1, 0, 6., axis=0)
+            T1 = transform44(vec1)
+
+            vec2 = get_observations_from_gt(n, index=1)
+            vec2 = np.insert(vec2, 0, 6., axis=0)
+            T2 = transform44(vec2)
+
+            T_rel = np.dot(np.linalg.inv(T1), T2)
+            err_t, err_R = utils.compute_pose_error(T_rel, R, t)
+
+        angle_error.append(err_R)
+        translation_error.append(err_t)
+
+    return {
+        "R_hat_mean": np.mean(angle_error),
+        "R_hat_std": np.std(angle_error),
+        "t_hat_mean": np.mean(translation_error),
+        "t_hat_std": np.std(translation_error),
+    }
+
+
+def kitti_rotation_error(path_to_results='results/kitti_test_output/'):
+    K = np.array(
+        "9.812178e+02 0.000000e+00 6.900000e+02 0.000000e+00 9.758994e+02 2.471364e+02 0.000000e+00 0.000000e+00 1.000000e+00".split()).astype(
+        float).reshape(3, 3)
+    names = [n for n in sorted(os.listdir(path_to_results)) if n.endswith('npz')]
+    OXTS_BASE_PATH = os.path.abspath('./data/kitti/campus/2011_09_28_image/oxts/data/')
+    files = [os.path.join(OXTS_BASE_PATH, file_name) for file_name in os.listdir(OXTS_BASE_PATH) if
+             file_name.endswith('.txt')]
+    output = pykitti.utils.load_oxts_packets_and_poses(files)
+
+    angle_error = []
+    translation_error = []
+
+    for i in range(len(names)):
+        n = os.path.join(path_to_results, names[i])
+
+        loaded_data = np.load(n, allow_pickle=True)
+        if 'arr_0' in loaded_data.keys():
+            loaded_data = loaded_data['arr_0'][()]
+        match_indices = loaded_data['matches'][loaded_data['matches'] > -1]
+        points1 = loaded_data['keypoints0'][loaded_data['matches'] > -1]
+        points2 = loaded_data['keypoints1'][match_indices]
+
+        ret = utils.estimate_pose(points1, points2, K, K, 3.)
+        R, t, inliers = ret
+        T_rel = np.dot(np.linalg.inv(output[i].T_w_imu), output[i + 1].T_w_imu)
+        err_t, err_R = utils.compute_pose_error(T_rel, R, t)
+
+        angle_error.append(err_R)
+        translation_error.append(err_t)
+
+    return {
+        "R_hat_mean": np.mean(angle_error),
+        "R_hat_std": np.std(angle_error),
+        "t_hat_mean": np.mean(translation_error),
+        "t_hat_std": np.std(translation_error),
     }
 
 
