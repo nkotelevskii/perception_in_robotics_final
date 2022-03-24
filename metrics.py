@@ -170,6 +170,7 @@ def rgbd_rotation_error(path_to_results='results/kitti_test_output/'):
 
         ret = utils.estimate_pose(points1, points2, K, K, 3.)
         if ret is None:
+            continue
             err_t, err_R = np.inf, np.inf
         else:
             R, t, inliers = ret
